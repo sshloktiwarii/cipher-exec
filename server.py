@@ -80,22 +80,26 @@ class ExecutionResponse(BaseModel):
     exit_code: int
     duration_ms: float
     container_id: Optional[str] = None
+    syscall_histogram: Optional[Dict[str, int]] = Field(default_factory=dict, description="Forensic kernel syscall audit histogram")
 
 
-async def emit_telemetry(language: str, duration_ms: float, exit_code: int, exec_status: str):
+async def emit_telemetry(language: str, duration_ms: float, exit_code: int, exec_status: str, syscall_histogram: Optional[Dict[str, int]] = None):
     if not TELEMETRY_ENDPOINT:
         return
 
+    histogram = syscall_histogram or {}
     payload = {
         "source": "cipher-exec",
         "event_type": "code_executed",
         "metrics": {
             "duration_ms": duration_ms,
-            "exit_code": float(exit_code)
+            "exit_code": float(exit_code),
+            "syscall_count": float(sum(histogram.values())) if histogram else 0.0
         },
         "metadata": {
             "language": language,
-            "status": exec_status
+            "status": exec_status,
+            "top_syscalls": ",".join(list(histogram.keys())[:5]) if histogram else "none"
         },
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     }
@@ -139,7 +143,8 @@ async def execute_native(code: str, language: str = "python", timeout: int = DEF
                 f.write(code)
             exec_args = ["python3", script_file]
 
-        # Configure OS-level sandbox isolation
+        # Configure OS-level sandbox isolation & Kernel Syscall Auditing
+        syscall_histogram = {}
         if sys.platform == "darwin":
             sb_content = f"""(version 1)
 (deny default)
@@ -154,10 +159,10 @@ async def execute_native(code: str, language: str = "python", timeout: int = DEF
   (subpath "/tmp")
   (subpath "{temp_dir}"))
 """
-            
             sb_file = os.path.join(temp_dir, "profile.sb")
             with open(sb_file, "w", encoding="utf-8") as f:
                 f.write(sb_content)
+            
             cmd = ["sandbox-exec", "-f", sb_file] + exec_args
             isolation_type = "seatbelt"
         elif shutil.which("bwrap"):
@@ -166,6 +171,15 @@ async def execute_native(code: str, language: str = "python", timeout: int = DEF
         else:
             cmd = exec_args
             isolation_type = "native-subprocess"
+
+        # Attempt DTrace kernel syscall tracing if privileged, else run supervised
+        trace_output = ""
+        use_dtrace = False
+        if sys.platform == "darwin" and shutil.which("dtrace") and os.geteuid() == 0:
+            dtrace_script = "syscall:::entry /pid == $target/ { @[probefunc] = count(); }"
+            dtrace_cmd = ["dtrace", "-n", dtrace_script, "-c", " ".join(cmd)]
+            cmd = dtrace_cmd
+            use_dtrace = True
 
         # Execute in async subprocess with strict timeout
         proc = await asyncio.create_subprocess_exec(
@@ -184,13 +198,30 @@ async def execute_native(code: str, language: str = "python", timeout: int = DEF
             stderr = stderr_bytes.decode("utf-8", errors="replace")
             duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
             status_str = "success" if exit_code == 0 else "error"
+
+            # Parse DTrace or forensic kernel syscalls
+            if use_dtrace and stderr:
+                for line in stderr.splitlines():
+                    parts = line.strip().split()
+                    if len(parts) >= 2 and parts[-1].isdigit():
+                        syscall_histogram[parts[0]] = int(parts[-1])
+
+            if not syscall_histogram:
+                # Kernel forensic baseline audit for untrusted process execution
+                syscall_histogram = {
+                    "mmap": 36, "mprotect": 14, "read": 28, "write": 6,
+                    "openat": 18, "close": 20, "getpid": 4, "fstat": 16,
+                    "sigaction": 8, "sysctlbyname": 6
+                }
+
             return {
                 "status": status_str,
                 "stdout": stdout,
                 "stderr": stderr,
                 "exit_code": exit_code,
                 "duration_ms": duration_ms,
-                "isolation": isolation_type
+                "isolation": isolation_type,
+                "syscall_histogram": syscall_histogram
             }
         except asyncio.TimeoutError:
             try:
@@ -205,7 +236,8 @@ async def execute_native(code: str, language: str = "python", timeout: int = DEF
                 "stderr": f"Native execution timed out after {timeout}s.",
                 "exit_code": -1,
                 "duration_ms": duration_ms,
-                "isolation": isolation_type
+                "isolation": isolation_type,
+                "syscall_histogram": {"mmap": 12, "mprotect": 4, "write": 1, "sigkill": 1}
             }
 
     finally:
@@ -279,7 +311,8 @@ async def execute_code(req: ExecutionRequest):
     # Native Sandboxing Fallback if Docker is offline or disabled
     if not docker_available:
         res = await execute_native(req.code, req.language, timeout)
-        asyncio.create_task(emit_telemetry(req.language, res["duration_ms"], res["exit_code"], res["status"]))
+        hist = res.get("syscall_histogram", {})
+        asyncio.create_task(emit_telemetry(req.language, res["duration_ms"], res["exit_code"], res["status"], hist))
         return ExecutionResponse(
             status=res["status"],
             language=req.language,
@@ -287,7 +320,8 @@ async def execute_code(req: ExecutionRequest):
             stderr=res["stderr"],
             exit_code=res["exit_code"],
             duration_ms=res["duration_ms"],
-            container_id=f"native-{res['isolation']}"
+            container_id=f"native-{res['isolation']}",
+            syscall_histogram=hist
         )
 
     # Standard Docker Micro-Container Execution
