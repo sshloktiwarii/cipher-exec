@@ -141,29 +141,19 @@ async def execute_native(code: str, language: str = "python", timeout: int = DEF
 
         # Configure OS-level sandbox isolation
         if sys.platform == "darwin":
-            sb_content = """(version 1)
+            sb_content = f"""(version 1)
 (deny default)
 (allow process-exec)
 (allow process-fork)
 (allow sysctl-read)
-(allow file-read*
-  (subpath "/Library")
-  (subpath "/System")
-  (subpath "/usr")
-  (subpath "/bin")
-  (subpath "/sbin")
-  (subpath "/Applications")
-  (subpath "/private/var")
-  (subpath "/private/tmp")
-  (subpath "/tmp")
-  (subpath "{temp_dir}"))
+(allow file-read*)
 (deny network*)
 (deny file-write*)
 (allow file-write*
   (subpath "/private/tmp")
   (subpath "/tmp")
   (subpath "{temp_dir}"))
-""".replace("{temp_dir}", temp_dir)
+"""
             
             sb_file = os.path.join(temp_dir, "profile.sb")
             with open(sb_file, "w", encoding="utf-8") as f:
