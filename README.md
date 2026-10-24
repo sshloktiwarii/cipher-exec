@@ -1,4 +1,4 @@
-# Foundry Crucible: Ephemeral AI Execution Sandbox
+# cipher-exec: Ephemeral AI Execution Sandbox
 
 A zero-trust execution environment built with Python, FastAPI, and Docker SDK designed to execute untrusted AI-generated code securely.
 
