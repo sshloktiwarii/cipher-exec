@@ -11,3 +11,6 @@ venv/
 build/
 dist/
 *.spec
+cipher-exec
+*.exe
+*.test
