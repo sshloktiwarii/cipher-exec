@@ -4,6 +4,8 @@ Kernel-isolated execution sandbox for untrusted code execution.
 
 Built in Go using native Apple Seatbelt (`sandbox-exec`) on macOS and Linux namespaces (`unshare`) and cgroups v2. Runs without Docker or external container runtimes.
 
+Looking for a plain-English, non-technical summary? See [EXPLAINER.md](EXPLAINER.md).
+
 ---
 
 ## Security Invariants
