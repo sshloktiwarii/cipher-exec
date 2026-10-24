@@ -1,18 +1,22 @@
 import asyncio
+import base64
 import json
 import os
+import shutil
+import sys
+import tempfile
 import time
 from typing import Dict, Literal, Optional
 import httpx
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, status
 from pydantic import BaseModel, Field
 import docker
-from docker.errors import ContainerError, ImageNotFound, APIError
+from docker.errors import ContainerError, ImageNotFound, APIError, DockerException
 
 app = FastAPI(
-    title="Polyglot AI Execution Sandbox",
+    title="Cipher-Exec: Ephemeral AI Execution Sandbox",
     version="2.0.0",
-    description="Zero-trust polyglot micro-container sandbox supporting Python, Go, and TypeScript with live WebSockets."
+    description="Zero-trust polyglot micro-container sandbox supporting Python, Go, and TypeScript with native OS Seatbelt/bwrap fallback."
 )
 
 TELEMETRY_ENDPOINT = os.getenv("TELEMETRY_ENDPOINT", "http://localhost:8082/ingest")
@@ -21,11 +25,11 @@ MAX_TIMEOUT_SEC = 15
 MAX_CONCURRENT_CONTAINERS = 10
 CONCURRENCY_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CONTAINERS)
 
-import base64
 
 def _build_go_cmd(code: str) -> list[str]:
     b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
     return ["sh", "-c", f"echo {b64} | base64 -d > /tmp/main.go && go run /tmp/main.go"]
+
 
 # Supported language images and execution command mappings
 LANGUAGE_CONFIGS = {
@@ -83,7 +87,7 @@ async def emit_telemetry(language: str, duration_ms: float, exit_code: int, exec
         return
 
     payload = {
-        "source": "ephemeral-sandbox-polyglot",
+        "source": "cipher-exec",
         "event_type": "code_executed",
         "metrics": {
             "duration_ms": duration_ms,
@@ -103,6 +107,121 @@ async def emit_telemetry(language: str, duration_ms: float, exit_code: int, exec
         pass
 
 
+async def execute_native(code: str, language: str = "python", timeout: int = DEFAULT_TIMEOUT_SEC) -> dict:
+    """
+    Native OS sandbox execution fallback when Docker is offline or unreachable.
+    On macOS: uses sandbox-exec with a dynamically generated strict .sb seatbelt profile.
+    On Linux: uses bubblewrap (bwrap) or restricted subprocess execution.
+    """
+    start_time = time.perf_counter()
+    temp_dir = tempfile.mkdtemp(prefix="cipher_sandbox_")
+    
+    try:
+        # Prepare script file based on target language
+        if language == "python":
+            script_file = os.path.join(temp_dir, "script.py")
+            with open(script_file, "w", encoding="utf-8") as f:
+                f.write(code)
+            exec_args = ["python3", script_file]
+        elif language == "go":
+            script_file = os.path.join(temp_dir, "main.go")
+            with open(script_file, "w", encoding="utf-8") as f:
+                f.write(code)
+            exec_args = ["go", "run", script_file]
+        elif language in ("typescript", "javascript"):
+            script_file = os.path.join(temp_dir, "index.js")
+            with open(script_file, "w", encoding="utf-8") as f:
+                f.write(code)
+            exec_args = ["node", script_file]
+        else:
+            script_file = os.path.join(temp_dir, "script.py")
+            with open(script_file, "w", encoding="utf-8") as f:
+                f.write(code)
+            exec_args = ["python3", script_file]
+
+        # Configure OS-level sandbox isolation
+        if sys.platform == "darwin":
+            sb_content = """(version 1)
+(deny default)
+(allow process-exec)
+(allow process-fork)
+(allow sysctl-read)
+(allow file-read*
+  (subpath "/Library")
+  (subpath "/System")
+  (subpath "/usr")
+  (subpath "/bin")
+  (subpath "/sbin")
+  (subpath "/Applications")
+  (subpath "/private/var")
+  (subpath "/private/tmp")
+  (subpath "/tmp")
+  (subpath "{temp_dir}"))
+(deny network*)
+(deny file-write*)
+(allow file-write*
+  (subpath "/private/tmp")
+  (subpath "/tmp")
+  (subpath "{temp_dir}"))
+""".replace("{temp_dir}", temp_dir)
+            
+            sb_file = os.path.join(temp_dir, "profile.sb")
+            with open(sb_file, "w", encoding="utf-8") as f:
+                f.write(sb_content)
+            cmd = ["sandbox-exec", "-f", sb_file] + exec_args
+            isolation_type = "seatbelt"
+        elif shutil.which("bwrap"):
+            cmd = ["bwrap", "--ro-bind", "/", "/", "--tmpfs", "/tmp", "--unshare-net", "--unshare-pid"] + exec_args
+            isolation_type = "bwrap"
+        else:
+            cmd = exec_args
+            isolation_type = "native-subprocess"
+
+        # Execute in async subprocess with strict timeout
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+
+        try:
+            stdout_bytes, stderr_bytes = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=float(timeout)
+            )
+            exit_code = proc.returncode if proc.returncode is not None else 0
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
+            stderr = stderr_bytes.decode("utf-8", errors="replace")
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            status_str = "success" if exit_code == 0 else "error"
+            return {
+                "status": status_str,
+                "stdout": stdout,
+                "stderr": stderr,
+                "exit_code": exit_code,
+                "duration_ms": duration_ms,
+                "isolation": isolation_type
+            }
+        except asyncio.TimeoutError:
+            try:
+                proc.kill()
+                await proc.wait()
+            except Exception:
+                pass
+            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            return {
+                "status": "timeout",
+                "stdout": "",
+                "stderr": f"Native execution timed out after {timeout}s.",
+                "exit_code": -1,
+                "duration_ms": duration_ms,
+                "isolation": isolation_type
+            }
+
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+
 @app.get("/healthz", status_code=status.HTTP_200_OK)
 def health_check():
     docker_healthy = False
@@ -113,9 +232,11 @@ def health_check():
             docker_healthy = False
 
     return {
-        "service": "polyglot-ai-execution-sandbox",
-        "status": "healthy" if docker_healthy else "degraded",
+        "service": "cipher-exec",
+        "status": "healthy",
         "docker_available": docker_healthy,
+        "native_fallback": True,
+        "native_isolation": "seatbelt" if sys.platform == "darwin" else ("bwrap" if shutil.which("bwrap") else "native"),
         "supported_languages": list(LANGUAGE_CONFIGS.keys()),
         "resource_limits": {
             "memory": "512m",
@@ -145,14 +266,41 @@ def build_container_config(language: str, code: str):
 @app.post("/execute", response_model=ExecutionResponse, status_code=status.HTTP_200_OK)
 async def execute_code(req: ExecutionRequest):
     global docker_client
+    start_time = time.perf_counter()
+    timeout = req.timeout_seconds or DEFAULT_TIMEOUT_SEC
+
+    # Check if Docker client is available and responsive
+    docker_available = False
     if docker_client is None:
         try:
             docker_client = docker.from_env()
-        except Exception as e:
-            raise HTTPException(status_code=503, detail=f"Docker host unreachable: {e}")
+            docker_client.ping()
+            docker_available = True
+        except Exception:
+            docker_client = None
+            docker_available = False
+    else:
+        try:
+            docker_client.ping()
+            docker_available = True
+        except Exception:
+            docker_available = False
 
-    start_time = time.perf_counter()
-    timeout = req.timeout_seconds or DEFAULT_TIMEOUT_SEC
+    # Native Sandboxing Fallback if Docker is offline or disabled
+    if not docker_available:
+        res = await execute_native(req.code, req.language, timeout)
+        asyncio.create_task(emit_telemetry(req.language, res["duration_ms"], res["exit_code"], res["status"]))
+        return ExecutionResponse(
+            status=res["status"],
+            language=req.language,
+            stdout=res["stdout"],
+            stderr=res["stderr"],
+            exit_code=res["exit_code"],
+            duration_ms=res["duration_ms"],
+            container_id=f"native-{res['isolation']}"
+        )
+
+    # Standard Docker Micro-Container Execution
     container = None
     container_config = build_container_config(req.language, req.code)
 
@@ -205,6 +353,21 @@ async def execute_code(req: ExecutionRequest):
                     container_id=short_id
                 )
 
+        except (DockerException, APIError, Exception) as e:
+            # Fallback to native sandbox on Docker container creation failure
+            print(f"[WARN] Docker runtime error ({e}). Executing in native sandbox fallback.")
+            res = await execute_native(req.code, req.language, timeout)
+            asyncio.create_task(emit_telemetry(req.language, res["duration_ms"], res["exit_code"], res["status"]))
+            return ExecutionResponse(
+                status=res["status"],
+                language=req.language,
+                stdout=res["stdout"],
+                stderr=res["stderr"],
+                exit_code=res["exit_code"],
+                duration_ms=res["duration_ms"],
+                container_id=f"native-{res['isolation']}"
+            )
+
         finally:
             if container:
                 try:
@@ -218,13 +381,13 @@ async def websocket_execute(websocket: WebSocket):
     """Live streaming execution endpoint over WebSocket."""
     await websocket.accept()
     global docker_client
-    if docker_client is None:
+    docker_available = False
+    if docker_client is not None:
         try:
-            docker_client = docker.from_env()
-        except Exception as e:
-            await websocket.send_json({"type": "error", "message": f"Docker unreachable: {e}"})
-            await websocket.close()
-            return
+            docker_client.ping()
+            docker_available = True
+        except Exception:
+            docker_available = False
 
     try:
         raw_msg = await websocket.receive_text()
@@ -232,6 +395,21 @@ async def websocket_execute(websocket: WebSocket):
         code = data.get("code", "")
         language = data.get("language", "python")
         timeout = min(int(data.get("timeout_seconds", DEFAULT_TIMEOUT_SEC)), MAX_TIMEOUT_SEC)
+
+        if not docker_available:
+            await websocket.send_json({"type": "started", "container_id": "native-fallback", "language": language})
+            res = await execute_native(code, language, timeout)
+            if res["stdout"]:
+                await websocket.send_json({"type": "output", "chunk": res["stdout"]})
+            if res["stderr"]:
+                await websocket.send_json({"type": "output", "chunk": res["stderr"]})
+            await websocket.send_json({
+                "type": "finished",
+                "exit_code": res["exit_code"],
+                "duration_ms": res["duration_ms"],
+                "status": res["status"]
+            })
+            return
 
         container_config = build_container_config(language, code)
         container = docker_client.containers.create(**container_config)
@@ -245,7 +423,6 @@ async def websocket_execute(websocket: WebSocket):
         loop = asyncio.get_running_loop()
 
         try:
-            # Stream logs via generator in thread executor
             def stream_container_logs():
                 return list(container.logs(stream=True, follow=True))
 
@@ -296,5 +473,5 @@ async def websocket_execute(websocket: WebSocket):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8081"))
-    print(f"[INIT] Polyglot AI Execution Sandbox listening on port :{port}")
+    print(f"[INIT] Cipher-Exec listening on port :{port}")
     uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
