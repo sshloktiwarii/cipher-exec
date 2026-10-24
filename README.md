@@ -1,6 +1,6 @@
-# Ephemeral AI Execution Sandbox
+# Foundry Crucible: Ephemeral AI Execution Sandbox
 
-A zero-trust execution environment built with Python, FastAPI, and the Docker SDK designed to execute untrusted AI-generated code securely.
+A zero-trust execution environment built with Python, FastAPI, and Docker SDK designed to execute untrusted AI-generated code securely.
 
 ## Zero-Trust Security Guarantees
 - **Isolated Network**: `network_mode="none"` prevents data exfiltration, socket creation, and internal network scanning.
