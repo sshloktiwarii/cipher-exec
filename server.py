@@ -18,6 +18,14 @@ app = FastAPI(
 TELEMETRY_ENDPOINT = os.getenv("TELEMETRY_ENDPOINT", "http://localhost:8082/ingest")
 DEFAULT_TIMEOUT_SEC = 5
 MAX_TIMEOUT_SEC = 15
+MAX_CONCURRENT_CONTAINERS = 10
+CONCURRENCY_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_CONTAINERS)
+
+import base64
+
+def _build_go_cmd(code: str) -> list[str]:
+    b64 = base64.b64encode(code.encode("utf-8")).decode("ascii")
+    return ["sh", "-c", f"echo {b64} | base64 -d > /tmp/main.go && go run /tmp/main.go"]
 
 # Supported language images and execution command mappings
 LANGUAGE_CONFIGS = {
@@ -27,7 +35,7 @@ LANGUAGE_CONFIGS = {
     },
     "go": {
         "image": "golang:1.24-alpine",
-        "cmd_builder": lambda code: ["sh", "-c", f"echo {json.dumps(code)} > /tmp/main.go && go run /tmp/main.go"],
+        "cmd_builder": _build_go_cmd,
     },
     "typescript": {
         "image": "node:22-alpine",
@@ -148,60 +156,61 @@ async def execute_code(req: ExecutionRequest):
     container = None
     container_config = build_container_config(req.language, req.code)
 
-    try:
-        container = docker_client.containers.create(**container_config)
-        container.start()
-        short_id = container.id[:12]
-
-        loop = asyncio.get_running_loop()
+    async with CONCURRENCY_SEMAPHORE:
         try:
-            result = await asyncio.wait_for(
-                loop.run_in_executor(None, container.wait),
-                timeout=float(timeout)
-            )
-            exit_code = result.get("StatusCode", -1)
-            stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
-            stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
-            exec_status = "success" if exit_code == 0 else "error"
+            container = docker_client.containers.create(**container_config)
+            container.start()
+            short_id = container.id[:12]
 
-            asyncio.create_task(emit_telemetry(req.language, duration_ms, exit_code, exec_status))
-
-            return ExecutionResponse(
-                status=exec_status,
-                language=req.language,
-                stdout=stdout,
-                stderr=stderr,
-                exit_code=exit_code,
-                duration_ms=duration_ms,
-                container_id=short_id
-            )
-
-        except asyncio.TimeoutError:
-            duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+            loop = asyncio.get_running_loop()
             try:
-                container.kill()
-            except Exception:
-                pass
+                result = await asyncio.wait_for(
+                    loop.run_in_executor(None, container.wait),
+                    timeout=float(timeout)
+                )
+                exit_code = result.get("StatusCode", -1)
+                stdout = container.logs(stdout=True, stderr=False).decode("utf-8", errors="replace")
+                stderr = container.logs(stdout=False, stderr=True).decode("utf-8", errors="replace")
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                exec_status = "success" if exit_code == 0 else "error"
 
-            asyncio.create_task(emit_telemetry(req.language, duration_ms, -1, "timeout"))
+                asyncio.create_task(emit_telemetry(req.language, duration_ms, exit_code, exec_status))
 
-            return ExecutionResponse(
-                status="timeout",
-                language=req.language,
-                stdout="",
-                stderr=f"Execution timed out after {timeout}s (0.5 CPU / 512MB limit).",
-                exit_code=-1,
-                duration_ms=duration_ms,
-                container_id=short_id
-            )
+                return ExecutionResponse(
+                    status=exec_status,
+                    language=req.language,
+                    stdout=stdout,
+                    stderr=stderr,
+                    exit_code=exit_code,
+                    duration_ms=duration_ms,
+                    container_id=short_id
+                )
 
-    finally:
-        if container:
-            try:
-                container.remove(force=True)
-            except Exception:
-                pass
+            except asyncio.TimeoutError:
+                duration_ms = round((time.perf_counter() - start_time) * 1000, 2)
+                try:
+                    container.kill()
+                except Exception:
+                    pass
+
+                asyncio.create_task(emit_telemetry(req.language, duration_ms, -1, "timeout"))
+
+                return ExecutionResponse(
+                    status="timeout",
+                    language=req.language,
+                    stdout="",
+                    stderr=f"Execution timed out after {timeout}s (0.5 CPU / 512MB limit).",
+                    exit_code=-1,
+                    duration_ms=duration_ms,
+                    container_id=short_id
+                )
+
+        finally:
+            if container:
+                try:
+                    container.remove(force=True)
+                except Exception:
+                    pass
 
 
 @app.websocket("/ws/execute")
