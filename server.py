@@ -464,4 +464,4 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8081"))
     print(f"[INIT] Cipher-Exec listening on port :{port}")
-    uvicorn.run("server:app", host="0.0.0.0", port=port, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")

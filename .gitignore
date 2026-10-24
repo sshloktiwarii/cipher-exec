@@ -8,3 +8,6 @@ venv/
 .coverage
 .DS_Store
 .env
+build/
+dist/
+*.spec
